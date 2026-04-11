@@ -7,6 +7,16 @@ const crypto = require('crypto')
 const path = require('node:path')
 const cors = require('cors')
 const multer = require('multer')
+const RESOLUTIONS = [
+  0.01,  // 10 ms
+  0.05,  // 50 ms
+  0.2,   // 200 ms
+  0.5,   // 500 ms
+  1,     // 1 s
+  5,     // 5 s
+  10     // 10 s
+]
+const RESOLUTION_LABELS = ['10 ms', '50 ms', '200 ms', '500 ms', '1 s', '5 s', '10 s']
 
 // Import and initialize storage system
 const storage_lib  = require('../storage')
@@ -18,8 +28,6 @@ const MICROSERVICES_URL = process.env.MICROSERVICES_URL
 // Enable CORS for this router
 router.use(cors())
 
-// Multer writes to a local temp dir for multipart parsing, then the route
-// handler moves the file into the abstract storage under a tmp/ prefix.
 const localTempDir = path.join(__dirname, '..', 'tmp', 'uploads')
 if (!fs.existsSync(localTempDir)) {
     fs.mkdirSync(localTempDir, { recursive: true })
@@ -50,12 +58,10 @@ router.get("/:id", (req, res) => {
 	res.json(dataset)
 })
 
-
 // Returns all files associated with a dataset
 router.get("/files/:id", async (req, res) => {
 	const datasetID = req.params.id
 	const files = await storage.datasetFiles(datasetID)
-
 	return res.json(files)
 })
 
@@ -85,7 +91,6 @@ router.get('/download/:id', async (req, res) => {
 
 		stream.on('error', (err) => {
 			console.error('Stream error:', err);
-
 			if(!res.headersSent) {
 				return res.status(500).json({ error: "Error streaming file" });
 			}
@@ -95,7 +100,6 @@ router.get('/download/:id', async (req, res) => {
 		console.error("Download error:", err);
 		res.status(500).json({ error: "Error downloading file" });
 	}
-
 })
 
 router.get('/download/csv/:id', async (req, res) => {
@@ -108,13 +112,11 @@ router.get('/download/csv/:id', async (req, res) => {
 		return res.status(404).json({ error: "Dataset not found" });
 	}
 
-	// Check if CSV needs to be generated
 	let needsConversion = false;
 
 	if (!await storage.exists(csv_key)) {
 		needsConversion = true;
 	} else {
-		// Compare CSV file modification time with dataset's updated_at
 		const csvStats = await storage.stat(csv_key);
 		const csvModTime = csvStats.lastModified;
 		const datasetUpdatedAt = new Date(dataset_meta.updated_at);
@@ -124,10 +126,8 @@ router.get('/download/csv/:id', async (req, res) => {
 		}
 	}
 
-	// Call microservices
 	if (needsConversion) {
 		try {
-			// TODO: Replace hardcoded URL with env var
 			const response = await fetch(`${MICROSERVICES_URL}/convert/json/csv`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -158,7 +158,6 @@ router.get('/download/csv/:id', async (req, res) => {
 
 		stream.on('error', (err) => {
 			console.error('Stream error:', err);
-
 			if(!res.headersSent) {
 				return res.status(500).json({ error: "Error streaming file" });
 			}
@@ -168,6 +167,54 @@ router.get('/download/csv/:id', async (req, res) => {
 		res.status(500).json({ error: "Error downloading file" });
 	}
 })
+
+// Returns dataset data filtered by resolution (in seconds), caches result to storage
+router.get('/data/:id', async (req, res) => {
+	const datasetID = req.params.id;
+	const resolution = parseFloat(req.query.resolution) || 1;
+
+	if (!RESOLUTIONS.includes(resolution)) {
+		return res.status(400).json({ error: `Invalid resolution. Must be one of: ${RESOLUTIONS.join(', ')}` });
+	}
+
+	if (!db_lib.getDatasetByID(datasetID)) {
+		return res.status(404).json({ error: `Dataset with id ${datasetID} does not exist.` });
+	}
+
+	const sourceKey = `${datasetID}.json`;
+	const label = RESOLUTION_LABELS[RESOLUTIONS.indexOf(resolution)];
+	const cachedKey = `${datasetID}-${label}.json`;
+
+	try {
+		if (!await storage.exists(sourceKey)) {
+			return res.status(404).json({ error: `Data file not found for dataset ${datasetID}` });
+		}
+
+		if (await storage.exists(cachedKey)) {
+			const cached = await storage.read(cachedKey);
+			return res.json(JSON.parse(cached.toString()));
+		}
+
+		const raw = await storage.read(sourceKey);
+		const dataJSON = JSON.parse(raw.toString());
+
+		const baseTime = dataJSON[0]?.sec ?? 0;
+		const seen = new Set();
+		const filtered = dataJSON.filter((elem) => {
+			const bucket = Math.floor((elem.sec - baseTime) / resolution);
+			if (seen.has(bucket)) return false;
+			seen.add(bucket);
+			return true;
+		});
+
+		await storage.write(cachedKey, JSON.stringify(filtered));
+
+		res.json(filtered);
+	} catch (err) {
+		console.error("Error fetching dataset data:", err);
+		res.status(500).json({ error: err.message });
+	}
+});
 
 // Receives a dataset file and uploads it to a temporary folder for further processing, returns a temporary ID
 router.post('/upload', upload.single('file'), async (req, res) => {
@@ -180,7 +227,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const localPath = req.file.path
 
     try {
-        // Move file from local temp dir into abstract storage
         const data = await fs.promises.readFile(localPath)
         await storage.write(storageKey, data)
         await fs.promises.unlink(localPath)
@@ -192,10 +238,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     }
 })
 
-
 // Returns validation information on the temporary dataset
 router.post('/validate/:tempID', async (req, res) => {
-	// For now return a true validation for everything
 	return res.status(200).json({ valid: true })
 })
 
@@ -217,7 +261,6 @@ router.post('/upload/confirm', async (req, res) => {
 		const id = crypto.randomUUID()
 		const now = new Date().toISOString().slice(0, 19).replace('T', ' ')
 
-		// Format date to SQLite datetime format (YYYY-MM-DD HH:MM:SS)
 		let formattedDate
 		if (date.includes('T')) {
 			formattedDate = date.replace('T', ' ') + ':00'
@@ -227,13 +270,11 @@ router.post('/upload/confirm', async (req, res) => {
 			formattedDate = `${date} 00:00:00`
 		}
 
-		// Move temp file to permanent storage
 		const permanentKey = `${id}.json`
 		const data = await storage.read(tempKey)
 		await storage.write(permanentKey, data)
 		await storage.delete(tempKey)
 
-		// Insert dataset record
 		const stmt = db.prepare(`
 			INSERT INTO Dataset (id, title, description, date, uploaded_at, updated_at,
 			                     location_id, vehicle_id, competition)
